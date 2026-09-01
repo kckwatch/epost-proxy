@@ -19,6 +19,37 @@ function assertPremiumCd(premiumcd) {
 }
 
 /**
+ * 보험취급 코드 (insutreatcd) — manual footnote 3.
+ * The sibling `insuyn` field comes back EMPTY from the live service for every
+ * country, on both premiumcd 31 and 32, so it cannot be used to decide
+ * insurability. Trusting it would mark all 184 destinations uninsurable, which
+ * for watch shipments is the difference between an insured parcel and an
+ * uninsured one.
+ */
+const INSURANCE_TREATMENT = {
+  '0': { insurable: false, label: '취급안함' },
+  '1': { insurable: true, label: '전국' },
+  '2': { insurable: true, label: '적용지역에 한함' },
+};
+
+export function readInsurance(row) {
+  const code = str(row.insutreatcd);
+  const known = INSURANCE_TREATMENT[code];
+  const flag = upper(row.insuyn);
+
+  return {
+    // Prefer the explicit flag when the server actually sends one; fall back to
+    // the treatment code, which it does populate.
+    insurable: flag === 'Y' ? true : flag === 'N' ? false : (known?.insurable ?? false),
+    insuranceCode: code,
+    insuranceNote: known?.label ?? (code ? `알 수 없는 코드 ${code}` : '정보 없음'),
+    // Region-limited cover is not blanket cover — surface it so a high-value
+    // shipment isn't assumed covered without checking.
+    insuranceRegionLimited: code === '2',
+  };
+}
+
+/**
  * 발송가능 국가 조회 — which countries this product can be sent to, with the
  * rate zone and whether insurance is available.
  */
@@ -26,7 +57,13 @@ export async function getNations(premiumcd = config.premiumCodes.EMS_PREMIUM) {
   const cd = assertPremiumCd(premiumcd);
   return cached(`nations:${cd}`, config.ttl.nations, async () => {
     const parsed = await callQuery(config.messages.nationList, { premiumcd: cd });
-    return collectNodes(parsed, 'RetrieveNationList')
+
+    const rows = collectNodes(parsed, 'RetrieveNationList');
+    if (rows.length === 0) {
+      throw new EpostError('발송가능 국가 조회 returned no rows', { status: 502 });
+    }
+
+    return rows
       .map((r) => ({
         code: upper(r.nationcd),
         nameKo: str(r.nationnm),
@@ -34,8 +71,7 @@ export async function getNations(premiumcd = config.premiumCodes.EMS_PREMIUM) {
         zone: str(r.prcapplyareacd),
         premiumcd: str(r.premiumcd),
         mailKind: str(r.frnmailkindcd) || null,
-        insurable: upper(r.insuyn) === 'Y',
-        insuranceCode: str(r.insutreatcd),
+        ...readInsurance(r),
       }))
       .filter((r) => r.code);
   });
@@ -56,27 +92,48 @@ export async function getNationCondition(nation, premiumcd, em_ee) {
 
 /**
  * 접수중지 및 배송지연 국가 조회.
+ *
+ * The manual presents `nationcd` as optional, but the live service rejects a
+ * call without it: "ERR-111: 필수값이 입력되지 않았습니다. 국가코드(nationcd)를
+ * 입력하여 주세요." So there is no way to fetch the whole suspension list —
+ * it has to be checked one destination at a time, right before shipping.
+ *
  * Cached for only an hour: suspensions appear with little notice (strikes,
  * disasters, customs actions) and shipping into one means the parcel comes back.
  */
-export async function getStoppedNations(premiumcd) {
-  const cd = premiumcd ? assertPremiumCd(premiumcd) : '';
-  return cached(`stopped:${cd}`, config.ttl.stopNations, async () => {
+export async function getSuspension(nation, premiumcd = config.premiumCodes.EMS_PREMIUM) {
+  const country = upper(nation);
+  const cd = assertPremiumCd(premiumcd);
+
+  if (!/^[A-Z]{2}$/.test(country)) {
+    throw new EpostError('nation must be a 2-letter country code', { status: 400 });
+  }
+
+  return cached(`stopped:${cd}:${country}`, config.ttl.stopNations, async () => {
     const parsed = await callQuery(config.messages.stopOrDelayNations, {
-      ...(cd ? { premiumcd: cd } : {}),
+      nationcd: country,
+      premiumcd: cd,
     });
+
     const rows = [
       ...collectNodes(parsed, 'RetrieveStopOrDelayNationList'),
       ...collectNodes(parsed, 'StopOrDelayNationList'),
     ];
-    return rows
+
+    const entries = rows
       .map((r) => ({
-        code: upper(r.nationcd ?? r.countrycd),
+        code: upper(r.nationcd ?? r.countrycd) || country,
         nameKo: str(r.nationnm),
         status: str(r.stopdelaysecd ?? r.sttus),
         note: str(r.rm ?? r.remark ?? r.cn),
       }))
-      .filter((r) => r.code);
+      .filter((e) => e.status || e.note);
+
+    return {
+      country,
+      suspended: entries.length > 0,
+      entries,
+    };
   });
 }
 
@@ -200,28 +257,40 @@ export async function getKpgZipCodes(nation, judocd, sidocd) {
 }
 
 /**
- * Composite pre-flight check for a destination: can we ship there at all, is it
- * currently suspended, and is insurance available? One call for the checkout page.
+ * Composite pre-flight check for one destination: can we ship there, is it
+ * currently suspended, is insurance available, which currency is allowed.
+ * One call for the order row before 접수신청.
  */
 export async function checkDestination(countryCode, premiumcd = config.premiumCodes.EMS_PREMIUM) {
   const code = upper(countryCode);
   const cd = assertPremiumCd(premiumcd);
 
-  const [{ value: nations }, stopped] = await Promise.all([
+  const [nationsResult, suspensionResult] = await Promise.allSettled([
     getNations(cd),
-    getStoppedNations(cd).catch(() => ({ value: [] })),
+    getSuspension(code, cd),
   ]);
 
-  const nation = nations.find((n) => n.code === code) ?? null;
-  const suspension = (stopped.value ?? []).find((s) => s.code === code) ?? null;
+  if (nationsResult.status === 'rejected') throw nationsResult.reason;
+  const nation = nationsResult.value.value.find((n) => n.code === code) ?? null;
+
+  // A suspension lookup failure must not read as "no suspension" — that would
+  // wave through a shipment into a country that is refusing mail.
+  const suspension =
+    suspensionResult.status === 'fulfilled' ? suspensionResult.value.value : null;
+  const suspensionUnknown = suspensionResult.status === 'rejected';
 
   return {
     country: code,
     premiumcd: cd,
-    shippable: Boolean(nation) && !suspension,
+    listed: Boolean(nation),
+    shippable: Boolean(nation) && !suspension?.suspended && !suspensionUnknown,
+    suspensionUnknown,
+    suspensionError: suspensionUnknown ? String(suspensionResult.reason?.message ?? '') : null,
     nation,
     suspension,
     insurable: nation?.insurable ?? false,
+    insuranceNote: nation?.insuranceNote ?? null,
+    insuranceRegionLimited: nation?.insuranceRegionLimited ?? false,
     preClearanceRequired: config.preClearanceCountries.has(code),
     currencyOptions: config.euCountries.has(code) ? ['USD', 'EUR'] : ['USD'],
   };
