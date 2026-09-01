@@ -13,6 +13,7 @@
  */
 import { config } from '../src/config.js';
 import { callQuery, callSecure, collectNodes } from '../src/eship.js';
+import { readInsurance } from '../src/queries.js';
 
 const FULL = process.argv.includes('--raw');
 const head = (s) => (FULL ? s : s.slice(0, 900));
@@ -66,15 +67,23 @@ await step('2. 발송가능 국가 조회 — PARSED', async () => {
     console.log('  first row:', JSON.stringify(rows[0]));
     for (const cc of ['US', 'JP', 'GB', 'DE', 'AU', 'SG', 'HK', 'CH']) {
       const hit = rows.find((r) => String(r.nationcd).toUpperCase() === cc);
-      console.log(`  ${cc}: ${hit ? `zone ${hit.prcapplyareacd}, insurable=${hit.insuyn}` : 'NOT LISTED'}`);
+      if (!hit) { console.log(`  ${cc}: NOT LISTED`); continue; }
+      const ins = readInsurance(hit);
+      console.log(
+        `  ${cc}: zone ${hit.prcapplyareacd}, 보험 ${ins.insurable ? 'O' : 'X'} (${ins.insuranceNote})`,
+      );
     }
   } else {
     console.log('  no rows under RetrieveNationList — check the raw dump above and fix queries.js');
   }
 });
 
-await step('3. 접수중지/배송지연 국가 — RAW', async () => {
-  const { status, body } = await raw(config.messages.stopOrDelayNations, { premiumcd: PREMIUM });
+// nationcd is mandatory on the live service despite the manual marking it optional.
+await step('3. 접수중지/배송지연 국가 (US) — RAW', async () => {
+  const { status, body } = await raw(config.messages.stopOrDelayNations, {
+    nationcd: 'US',
+    premiumcd: PREMIUM,
+  });
   console.log(`HTTP ${status}, ${body.length} bytes`);
   console.log(head(body));
 });
