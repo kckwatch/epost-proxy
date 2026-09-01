@@ -165,16 +165,40 @@ export function callQuery(messageName, params = {}, opts = {}) {
 
 /**
  * 신청 API: all business fields are SEED-encrypted into a single `regData`
- * parameter, and the auth parameter is named `key` rather than `regkey`.
- * POST is used because a full 접수신청 plaintext runs past a comfortable URL
- * length once encrypted to hex (which doubles the byte count).
+ * parameter.
+ *
+ * TWO DEVIATIONS FROM THE MANUAL, both established against the live service:
+ *
+ * 1. The manual says the auth parameter is `key` for 신청 APIs and `regkey` for
+ *    조회. It is `regkey` for both — sending `key` returns
+ *    "ERR-111: 필수값이 입력되지 않았습니다. 인증키(regkey)을(를) 입력하여 주세요."
+ *
+ * 2. The manual lists REST(GET, POST). POST returns an HTML login page rather
+ *    than XML, so only GET works.
+ *
+ * Do not "correct" either of these back to the manual without re-testing —
+ * both failures are silent-ish and hard to diagnose from the response.
+ *
+ * The URL length is a real concern (hex doubles the byte count of an already
+ * long 접수신청 plaintext), so oversized requests are caught below rather than
+ * being truncated by the server.
  */
 export function callSecure(messageName, fields, extraParams = {}, opts = {}) {
   const plain = buildRegData(fields);
   const regData = encryptData(config.ems.secretKey, plain);
+
+  // Typical server/proxy limit is 8KB for the whole request line.
+  if (regData.length > 7000) {
+    throw new EpostError(
+      `regData is ${regData.length} hex chars — too long for a GET request. ` +
+        'Reduce the number of customs line items or shorten address fields.',
+      { status: 400 },
+    );
+  }
+
   return call(
     messageName,
-    { key: config.ems.regKey, regData, ...extraParams },
-    { method: 'POST', ...opts },
+    { regkey: config.ems.regKey, regData, ...extraParams },
+    { method: 'GET', ...opts },
   );
 }
