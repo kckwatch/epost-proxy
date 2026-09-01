@@ -4,7 +4,7 @@ import { config } from './config.js';
 import { EpostError } from './eship.js';
 import { cacheStats, cacheClear } from './cache.js';
 import {
-  getNations, getStoppedNations, getRateQuote, getEnglishAddress,
+  getNations, getSuspension, getRateQuote, getEnglishAddress,
   getKpgJuDo, getKpgSiDo, getKpgZipCodes, checkDestination,
 } from './queries.js';
 import {
@@ -57,8 +57,9 @@ app.get('/api/epost/destination/:code', wrap(async (req, res) => {
   ok(res)(await checkDestination(req.params.code, req.query.premiumcd));
 }));
 
-app.get('/api/epost/suspensions', wrap(async (req, res) => {
-  const { value, fromCache } = await getStoppedNations(req.query.premiumcd);
+// nationcd is mandatory on the live service, so suspensions are per-country.
+app.get('/api/epost/suspensions/:code', wrap(async (req, res) => {
+  const { value, fromCache } = await getSuspension(req.params.code, req.query.premiumcd);
   ok(res)(value, fromCache);
 }));
 
