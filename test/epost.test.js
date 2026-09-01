@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 
 process.env.EPOST_EMS_KEY ??= 'testkey';
 process.env.EPOST_EMS_SECRET ??= '0123456789abcdef';
@@ -222,4 +223,70 @@ test('at least one customs item is always required', () => {
 
 test('an unknown premiumcd is rejected with the valid options', () => {
   assert.ok(failsOn(check({ premiumcd: '99' }), 'premiumcd'));
+});
+
+/* ------------------------------------------------------------------ *
+ * Live-service behaviour learned from probe:api
+ * ------------------------------------------------------------------ */
+
+const { readInsurance } = await import('../src/queries.js');
+
+test('insurability is read from insutreatcd, because insuyn arrives empty', () => {
+  // The live service returns <insuyn></insuyn> for every country on both
+  // premiumcd 31 and 32, while populating insutreatcd. Reading insuyn alone
+  // would mark all 184 destinations uninsurable.
+  assert.equal(readInsurance({ insuyn: '', insutreatcd: '1' }).insurable, true);
+  assert.equal(readInsurance({ insuyn: '', insutreatcd: '2' }).insurable, true);
+  assert.equal(readInsurance({ insuyn: '', insutreatcd: '0' }).insurable, false);
+});
+
+test('region-limited cover is flagged rather than treated as blanket cover', () => {
+  const r = readInsurance({ insuyn: '', insutreatcd: '2' });
+  assert.equal(r.insurable, true);
+  assert.equal(r.insuranceRegionLimited, true);
+  assert.match(r.insuranceNote, /적용지역/);
+});
+
+test('an explicit insuyn still wins if the service ever starts sending one', () => {
+  assert.equal(readInsurance({ insuyn: 'N', insutreatcd: '1' }).insurable, false);
+  assert.equal(readInsurance({ insuyn: 'Y', insutreatcd: '0' }).insurable, true);
+});
+
+test('an unknown or missing treatment code fails closed', () => {
+  assert.equal(readInsurance({ insuyn: '', insutreatcd: '' }).insurable, false);
+  assert.equal(readInsurance({ insuyn: '', insutreatcd: '9' }).insurable, false);
+  assert.match(readInsurance({ insuyn: '', insutreatcd: '9' }).insuranceNote, /알 수 없는/);
+});
+
+test('a country row with an empty insuyn is still insurable when insutreatcd=1', () => {
+  // Guard against a regression to `upper(r.insuyn) === 'Y'`.
+  const src = readFileSync(new URL('../src/queries.js', import.meta.url), 'utf8');
+  assert.ok(
+    !/insurable:\s*upper\(r\.insuyn\)\s*===\s*'Y'/.test(src),
+    'insurability must not be derived from insuyn alone',
+  );
+  assert.ok(
+    /INSURANCE_TREATMENT/.test(src),
+    'the insutreatcd lookup table must be present',
+  );
+});
+
+test('secure calls use regkey and GET, matching the live service', () => {
+  const src = readFileSync(new URL('../src/eship.js', import.meta.url), 'utf8');
+  assert.ok(
+    /regkey: config\.ems\.regKey, regData/.test(src),
+    'the manual says `key`, but the server demands `regkey`',
+  );
+  assert.ok(
+    /\{ method: 'GET', \.\.\.opts \}/.test(src),
+    'POST returns an HTML login page; only GET works',
+  );
+});
+
+test('suspension lookup sends the mandatory nationcd', () => {
+  const src = readFileSync(new URL('../src/queries.js', import.meta.url), 'utf8');
+  assert.ok(
+    /nationcd: country/.test(src),
+    'the live service rejects a suspension query without nationcd',
+  );
 });
