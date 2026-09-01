@@ -6,11 +6,11 @@
   "description": "우체국 계약고객 EMS/K-Packet OpenAPI proxy for standardtime.watch",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "dev": "node --env-file=.env --watch src/server.js",
     "test": "node --test test/epost.test.js",
-    "probe:api": "node scripts/probe-api.js",
-    "probe:trace": "node scripts/probe-trace.js"
+    "probe:api": "node --env-file=.env scripts/probe-api.js",
+    "probe:trace": "node --env-file=.env scripts/probe-trace.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
